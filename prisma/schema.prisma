@@ -1,0 +1,641 @@
+// EPC Workforce — KPI-focused work & employee management
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────
+// Organisation & access control
+// ─────────────────────────────────────────────────────────────
+
+/// One row per box on the org chart. `parent` mirrors the reporting line,
+/// which drives team scoping (a head sees everyone in their subtree) and the
+/// purchase-order approval chain.
+model Role {
+  id            String                  @id @default(cuid())
+  key           String                  @unique // stable identifier, e.g. "HEAD_SITE_OPS"
+  name          String                  @unique // display name, e.g. "Head - Site Operations"
+  department    String // Management | Office | Design | Site | Procurement | Costing
+  description   String?
+  isSuperAdmin  Boolean                 @default(false)
+  /// Max purchase-order value this role may give final approval for (INR).
+  /// null = no approval authority. Super admins are unlimited.
+  approvalLimit Decimal?                @db.Decimal(14, 2)
+  sortOrder     Int                     @default(0)
+  parentId      String?
+  parent        Role?                   @relation("RoleHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children      Role[]                  @relation("RoleHierarchy")
+  users         User[]
+  permissions   Permission[]
+  poApprovals   PurchaseOrderApproval[]
+  awaitingPOs   PurchaseOrder[]         @relation("POAwaitingRole")
+  createdAt     DateTime                @default(now())
+  updatedAt     DateTime                @updatedAt
+}
+
+model Permission {
+  id    String @id @default(cuid())
+  key   String @unique // e.g. "attendance.review"
+  label String
+  group String
+  roles Role[]
+}
+
+model User {
+  id            String    @id @default(cuid())
+  employeeCode  String?   @unique
+  name          String
+  email         String    @unique
+  phone         String?
+  designation   String?
+  passwordHash  String
+  isActive      Boolean   @default(true)
+  roleId        String
+  role          Role      @relation(fields: [roleId], references: [id])
+  /// The project whose geofence is used by default for this employee's attendance.
+  mainProjectId String?
+  mainProject   Project?  @relation("MainProject", fields: [mainProjectId], references: [id], onDelete: SetNull)
+  /// Line manager. Drives "team under a head" for workflow assignment pools and reassignment.
+  reportsToId   String?
+  reportsTo     User?     @relation("ReportsTo", fields: [reportsToId], references: [id], onDelete: SetNull)
+  reports       User[]    @relation("ReportsTo")
+  lastLoginAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  attendances         Attendance[]            @relation("AttendanceUser")
+  reviewedAttendances Attendance[]            @relation("AttendanceReviewer")
+  projects            ProjectMember[]
+  siteLogs            SiteLog[]
+  purchaseOrders      PurchaseOrder[]         @relation("POCreatedBy")
+  poApprovals         PurchaseOrderApproval[]
+  taskAssignments     TaskAssignee[]
+  reviewingTasks      Task[]                  @relation("TaskReviewer")
+  plannedChanges      Task[]                  @relation("TaskPlannedChangedBy")
+  assignmentsFrom     TaskAssignmentHistory[] @relation("AssignmentFrom")
+  assignmentsTo       TaskAssignmentHistory[] @relation("AssignmentTo")
+  assignmentsMade     TaskAssignmentHistory[] @relation("AssignmentChangedBy")
+  delaysFlagged       TaskDelay[]
+  taskReviews         TaskReview[]
+  taskEvents          TaskEvent[]
+  notifications       Notification[]
+  phasesStarted       ProjectPhase[]
+  designApprovals     Project[]               @relation("DesignApprovedBy")
+  kpis                EmployeeKpi[]
+
+  @@index([roleId])
+  @@index([reportsToId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Projects
+// ─────────────────────────────────────────────────────────────
+
+enum OutOfRangePolicy {
+  FLAG // allow check-in, queue for manager review
+  BLOCK // refuse check-in outside the radius
+}
+
+model Project {
+  id               String           @id @default(cuid())
+  projectCode      String           @unique
+  projectName      String
+  projectStage     String // Enquiry | Design | Ongoing | On Hold | Completed | Cancelled
+  projectCategory  String // Construction | Renovation | Interior | ...
+  startDate        DateTime         @db.Date
+  endDate          DateTime         @db.Date
+  address          String
+  latitude         Float
+  longitude        Float
+  companyBranch    String?
+  attendanceRadius Int              @default(250) // metres
+  outOfRangePolicy OutOfRangePolicy @default(FLAG)
+  projectValue     Decimal?         @db.Decimal(14, 2)
+  orientation      String?
+  dimension        String?
+  scopeOfWork      String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  // Workflow engine
+  currentPhase          Phase     @default(DESIGN_1)
+  designApprovedAt      DateTime?
+  designApprovedById    String?
+  designApprovedBy      User?     @relation("DesignApprovedBy", fields: [designApprovedById], references: [id], onDelete: SetNull)
+  /// Planned construction kickoff chosen by Head - Site Operations (anchor for construction dates).
+  constructionKickoff   DateTime? @db.Date
+  /// When "Start phase" was clicked for Construction Phase 1.
+  constructionStartedAt DateTime?
+
+  members        ProjectMember[]
+  attendances    Attendance[]
+  locations      ProjectLocation[]
+  phases         ProjectPhase[]
+  tasks          Task[]
+  notifications  Notification[]
+  mainForUsers   User[]            @relation("MainProject")
+  siteLogs       SiteLog[]
+  boqItems       BoqItem[]
+  purchaseOrders PurchaseOrder[]
+
+  @@index([projectStage])
+  @@index([projectCategory])
+}
+
+model ProjectMember {
+  id          String   @id @default(cuid())
+  projectId   String
+  userId      String
+  projectRole String? // e.g. "Site Engineer", "Lead Architect"
+  assignedAt  DateTime @default(now())
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([userId])
+}
+
+/// Hierarchical site breakdown: Block → Floor → Zone/Room …
+model ProjectLocation {
+  id        String            @id @default(cuid())
+  projectId String
+  parentId  String?
+  name      String
+  type      String? // Block | Floor | Zone | Room | Area
+  sortOrder Int               @default(0)
+  project   Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  parent    ProjectLocation?  @relation("LocationTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children  ProjectLocation[] @relation("LocationTree")
+
+  @@index([projectId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Attendance
+// ─────────────────────────────────────────────────────────────
+
+enum AttendanceType {
+  CHECK_IN
+  CHECK_OUT
+}
+
+enum ReviewStatus {
+  NOT_REQUIRED // in range — nothing to review
+  PENDING // out of range — waiting for a manager
+  APPROVED
+  REJECTED
+}
+
+model Attendance {
+  id             String         @id @default(cuid())
+  userId         String
+  projectId      String
+  type           AttendanceType
+  selfieUrl      String // app-relative URL served by /api/files (auth-checked)
+  latitude       Float
+  longitude      Float
+  accuracyMeters Float?
+  locationLabel  String? // detected / self-reported place name
+  distanceMeters Float
+  radiusMeters   Int // project radius at the time of capture
+  inRange        Boolean
+  deviceInfo     String?
+  timestamp      DateTime       @default(now())
+
+  reviewStatus ReviewStatus @default(NOT_REQUIRED)
+  reviewedById String?
+  reviewedAt   DateTime?
+  reviewNote   String?
+
+  /// For a CHECK_OUT: the CHECK_IN it closes.
+  checkInId String?     @unique
+  checkIn   Attendance? @relation("CheckInOut", fields: [checkInId], references: [id], onDelete: SetNull)
+  checkOut  Attendance? @relation("CheckInOut")
+
+  user       User    @relation("AttendanceUser", fields: [userId], references: [id], onDelete: Cascade)
+  project    Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  reviewedBy User?   @relation("AttendanceReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+
+  @@index([userId, timestamp])
+  @@index([projectId, timestamp])
+  @@index([reviewStatus])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Site operations
+// ─────────────────────────────────────────────────────────────
+
+model SiteLog {
+  id        String   @id @default(cuid())
+  projectId String
+  authorId  String
+  date      DateTime @db.Date
+  weather   String?
+  manpower  Int?
+  workDone  String
+  issues    String?
+  createdAt DateTime @default(now())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, date])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Costing
+// ─────────────────────────────────────────────────────────────
+
+model BoqItem {
+  id          String   @id @default(cuid())
+  projectId   String
+  section     String // Civil | Structural | Interior | Electrical | Plumbing | ...
+  itemCode    String?
+  description String
+  unit        String
+  quantity    Decimal  @db.Decimal(14, 3)
+  rate        Decimal  @db.Decimal(14, 2)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Procurement
+// ─────────────────────────────────────────────────────────────
+
+model Vendor {
+  id             String          @id @default(cuid())
+  name           String          @unique
+  category       String? // Cement & Steel | Tiles | Electrical | ...
+  contactPerson  String?
+  phone          String?
+  email          String?
+  gstin          String?
+  address        String?
+  isActive       Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  purchaseOrders PurchaseOrder[]
+}
+
+enum POStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model PurchaseOrder {
+  id             String                  @id @default(cuid())
+  poNumber       String                  @unique
+  projectId      String
+  vendorId       String
+  description    String
+  amount         Decimal                 @db.Decimal(14, 2)
+  status         POStatus                @default(PENDING)
+  createdById    String
+  /// Role whose sign-off is needed next; null once decided.
+  awaitingRoleId String?
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+  project        Project                 @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  vendor         Vendor                  @relation(fields: [vendorId], references: [id])
+  createdBy      User                    @relation("POCreatedBy", fields: [createdById], references: [id])
+  awaitingRole   Role?                   @relation("POAwaitingRole", fields: [awaitingRoleId], references: [id], onDelete: SetNull)
+  approvals      PurchaseOrderApproval[]
+
+  @@index([status, awaitingRoleId])
+}
+
+enum ApprovalDecision {
+  APPROVED
+  ESCALATED // endorsed, but the amount exceeds this role's limit — forwarded up the chain
+  REJECTED
+}
+
+model PurchaseOrderApproval {
+  id              String           @id @default(cuid())
+  purchaseOrderId String
+  approverId      String
+  roleId          String
+  decision        ApprovalDecision
+  note            String?
+  createdAt       DateTime         @default(now())
+  purchaseOrder   PurchaseOrder    @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  approver        User             @relation(fields: [approverId], references: [id])
+  role            Role             @relation(fields: [roleId], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Workflow engine (Enquiry → Design → Construction)
+// Templates are data (WorkflowTemplate → PhaseTemplate → TaskTemplate);
+// real Task rows are generated per project as phases are reached.
+// ─────────────────────────────────────────────────────────────
+
+enum Phase {
+  DESIGN_1 // Enquiry to elevation
+  DESIGN_2 // Working drawings
+  DESIGN_3 // Interior design
+  DESIGN_4 // Interior working drawings
+  CONSTRUCTION // sub-phase 1–4 in constructionPhase
+}
+
+enum TaskStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  IN_REVIEW
+  REWORK
+  COMPLETED
+}
+
+enum TaskKind {
+  STAGE // real work
+  PHASE_START // "Start <next phase>" handoff for the owning head
+  APPROVAL // "Approve design" gate
+}
+
+enum DateSource {
+  AUTO
+  CUSTOM
+}
+
+/// Add new delay types here (plus a migration) when needed.
+enum DelayType {
+  IN_HOUSE
+  CLIENT_SIDE
+  REWORK
+}
+
+enum ReviewDecision {
+  SUBMITTED
+  APPROVED
+  SENT_BACK
+}
+
+enum PhaseStatus {
+  LOCKED // not reached yet
+  AWAITING_START // Start task created, waiting for the head
+  ACTIVE
+  COMPLETED
+}
+
+enum NotificationType {
+  ASSIGNED
+  REASSIGNED
+  START_TASK_CREATED
+  REVIEW_REQUESTED
+  APPROVED
+  SENT_BACK
+  DELAY_FLAGGED
+  DUE_SOON
+  DUE_TODAY
+  OVERDUE
+  ESCALATION
+  REVIEW_WAITING
+  START_TASK_WAITING
+}
+
+model WorkflowTemplate {
+  id     String          @id @default(cuid())
+  key    String          @unique
+  name   String
+  phases PhaseTemplate[]
+}
+
+model PhaseTemplate {
+  id                 String           @id @default(cuid())
+  workflowTemplateId String
+  key                String           @unique // DESIGN_1 … DESIGN_4, CONSTRUCTION_1 … CONSTRUCTION_4
+  phase              Phase
+  constructionPhase  Int?
+  name               String
+  order              Int
+  /// Role of the head who starts this phase and owns its tasks (department head).
+  ownerRoleKey       String
+  /// Phases sharing a group have their tasks generated together (all construction tasks at once).
+  taskGroup          String
+  /// When the Start task is created, e.g. {"type":"PHASE_COMPLETE","phase":"DESIGN_1"}.
+  startTrigger       Json
+  /// Planned date of the Start task; null = custom date set by the head.
+  startPlannedRule   Json?
+  workflowTemplate   WorkflowTemplate @relation(fields: [workflowTemplateId], references: [id], onDelete: Cascade)
+  tasks              TaskTemplate[]
+}
+
+model TaskTemplate {
+  id                      String        @id @default(cuid())
+  key                     String        @unique
+  phaseTemplateId         String
+  kind                    TaskKind      @default(STAGE)
+  phase                   Phase
+  constructionPhase       Int?
+  order                   Int
+  name                    String
+  durationDays            Int?
+  requiresReview          Boolean       @default(true)
+  reviewerRoleKey         String?
+  /// e.g. {"from":"PROJECT_START","days":10} or {"from":"TASK_END","taskKey":"c_excavation","days":37}; null = custom date.
+  offsetRule              Json?
+  /// Task this one follows in sequence (null = first of its track).
+  afterKey                String?
+  assigneeRoleKeys        String[]
+  preferredRoleKeys       String[]
+  defaultAssigneeRoleKeys String[]
+  multiAssignee           Boolean       @default(false)
+  /// Hard auto dates; overriding needs a reason.
+  milestone               Boolean       @default(false)
+  phaseTemplate           PhaseTemplate @relation(fields: [phaseTemplateId], references: [id], onDelete: Cascade)
+}
+
+model ProjectPhase {
+  id          String      @id @default(cuid())
+  projectId   String
+  key         String // PhaseTemplate.key
+  status      PhaseStatus @default(LOCKED)
+  actualStart DateTime?   @db.Date
+  actualEnd   DateTime?   @db.Date
+  startedById String?
+  startedAt   DateTime?
+  project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  startedBy   User?       @relation(fields: [startedById], references: [id], onDelete: SetNull)
+
+  @@unique([projectId, key])
+}
+
+model Task {
+  id                      String     @id @default(cuid())
+  projectId               String
+  templateKey             String
+  kind                    TaskKind   @default(STAGE)
+  phaseKey                String // PhaseTemplate.key this task belongs to
+  phase                   Phase
+  constructionPhase       Int?
+  /// PHASE_START tasks: the phase this task opens.
+  startsPhaseKey          String?
+  startsPhase             Phase?
+  startsConstructionPhase Int?
+  order                   Int
+  name                    String
+  status                  TaskStatus @default(NOT_STARTED)
+
+  plannedStart           DateTime?  @db.Date
+  plannedEnd             DateTime?  @db.Date
+  plannedSource          DateSource @default(AUTO)
+  originalAutoPlannedEnd DateTime?  @db.Date
+  plannedChangedById     String?
+  plannedChangedAt       DateTime?
+  /// Accumulated client-side delay shift applied on top of the base dates.
+  shiftDays              Int        @default(0)
+
+  actualStart DateTime? @db.Date
+  actualEnd   DateTime? @db.Date
+  /// false for construction tasks until Head - Site Operations starts construction.
+  visible     Boolean   @default(true)
+
+  submittedAt     DateTime? // first submission for review
+  lastSubmittedAt DateTime?
+  reworkCount     Int       @default(0)
+  reviewerId      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project          Project                 @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  reviewer         User?                   @relation("TaskReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+  plannedChangedBy User?                   @relation("TaskPlannedChangedBy", fields: [plannedChangedById], references: [id], onDelete: SetNull)
+  assignees        TaskAssignee[]
+  history          TaskAssignmentHistory[]
+  delays           TaskDelay[]
+  reviews          TaskReview[]
+  events           TaskEvent[]
+  notifications    Notification[]
+
+  @@unique([projectId, templateKey])
+  @@index([projectId, phaseKey, order])
+  @@index([status])
+}
+
+model TaskAssignee {
+  id         String   @id @default(cuid())
+  taskId     String
+  userId     String
+  assignedAt DateTime @default(now())
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, userId])
+  @@index([userId])
+}
+
+model TaskAssignmentHistory {
+  id          String   @id @default(cuid())
+  taskId      String
+  fromUserId  String?
+  toUserId    String
+  changedById String
+  reason      String?
+  at          DateTime @default(now())
+  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  fromUser    User?    @relation("AssignmentFrom", fields: [fromUserId], references: [id], onDelete: SetNull)
+  toUser      User     @relation("AssignmentTo", fields: [toUserId], references: [id], onDelete: Cascade)
+  changedBy   User     @relation("AssignmentChangedBy", fields: [changedById], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+}
+
+model TaskDelay {
+  id               String    @id @default(cuid())
+  taskId           String
+  type             DelayType
+  reason           String
+  delayDays        Int
+  shiftedFollowing Boolean   @default(false)
+  flaggedById      String
+  flaggedAt        DateTime  @default(now())
+  task             Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  flaggedBy        User      @relation(fields: [flaggedById], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+}
+
+model TaskReview {
+  id       String         @id @default(cuid())
+  taskId   String
+  decision ReviewDecision
+  note     String? // required when SENT_BACK
+  byUserId String
+  at       DateTime       @default(now())
+  task     Task           @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  byUser   User           @relation(fields: [byUserId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+}
+
+/// Audit trail: phase starts, sequence/date overrides, planned-date changes, completions.
+model TaskEvent {
+  id       String   @id @default(cuid())
+  taskId   String
+  type     String
+  note     String?
+  data     Json?
+  byUserId String?
+  at       DateTime @default(now())
+  task     Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  byUser   User?    @relation(fields: [byUserId], references: [id], onDelete: SetNull)
+
+  @@index([taskId])
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  type      NotificationType
+  taskId    String?
+  projectId String?
+  message   String
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+  /// One reminder per task per type per user per day, e.g. "OVERDUE:<taskId>:<userId>:2026-10-09".
+  dedupeKey String           @unique
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task      Task?            @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  project   Project?         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+}
+
+/// Key/value settings (e.g. reminder schedule), editable by the MD.
+model AppSetting {
+  key         String   @id
+  value       Json
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+}
+
+// ─────────────────────────────────────────────────────────────
+// Employee KPIs (stored scores — entered/imported, not calculated here)
+// ─────────────────────────────────────────────────────────────
+
+/// KPI points for one employee for one month. `metrics` holds the breakdown
+/// as [{ key, label, points, max }]; `totalPoints` is out of 100.
+model EmployeeKpi {
+  id          String   @id @default(cuid())
+  userId      String
+  period      String // "YYYY-MM"
+  totalPoints Int
+  rating      String // Outstanding | Exceeds | Meets | Needs improvement
+  metrics     Json
+  remarks     String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, period])
+  @@index([period])
+}
